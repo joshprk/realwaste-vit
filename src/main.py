@@ -1,90 +1,102 @@
-#!/usr/bin/python
+from torchvision.datasets import ImageFolder
 from torchvision.models import VisionTransformer
+from torchvision import transforms
 from torch.optim import Adam
 from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils import data
-from torchvision import transforms
+from torch import Tensor, DeviceObjType
 import torch
-import torchvision
 
+from typing import Tuple
 from pathlib import Path
 from urllib import request
 from zipfile import ZipFile
+import shutil
 import os
 
-# Static URL to UCI Machine Learning Repository
-DATASET_URL = \
-    'https://archive.ics.uci.edu/static/public/908/realwaste.zip'
+CLASSES = ["Plastic", "Vegetation"]
 
-TEST_DATA_PERCENT = .2
-N_EPOCHS = 10
-LEARNING_RATE = 0.001
+DATASET_URL = "https://archive.ics.uci.edu/static/public/908/realwaste.zip"
+DATASET_TEST_PERCENT = 0.2
 
-class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
-    def __getitem__(self, index):
-        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
-        path = self.imgs[index][0]
-        tuple_with_path = (original_tuple + (path,))
-        return tuple_with_path
+EPOCHS = 10
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 16
 
-if not os.path.exists('realwaste-main'):
-    print('dataset missing')
-    print("download directly from {}".format(DATASET_URL))
-    exit(1)
-    """
-    zip_path = Path('./realwaste.zip')
+ZIP_PATH = Path("./realwaste.zip")
+DATASET_PATH = Path("./RealWaste")
+MODEL_PATH = Path("./model.pth")
 
-    print('dataset directory {DATASET_DIR} does not exist')
-    if not zip_path.is_file():
-        print('downloading realwaste.zip')
-        request.urlretrieve(DATASET_URL, zip_path)
 
-    print('extracting dataset to {DATASET_DIR}')
-    with ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall('.')
-    """
+class NamedImageFolder(ImageFolder):
+    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor, str]:
+        original = super(NamedImageFolder, self).__getitem__(index)
+        name = self.imgs[index][0].split("/")[-2:]
 
-dataset = ImageFolderWithPaths(
-    root='./realwaste-main/RealWaste/', 
-    transform=transforms.Compose([
-        transforms.Resize((500, 500)),
-        transforms.ToTensor()
-        ]),
-)
-dataset, test_dataset = data.random_split(
-    dataset, 
-    [1 - TEST_DATA_PERCENT, TEST_DATA_PERCENT]
-)
+        return original + (name,)
 
-model = None
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model_path = Path('./model')
-if model_path.is_file():
-    model = torch.load(model_path, weights_only=False).to(device)
-else:
+
+def get_datasets() -> Tuple[Subset]:
+    download = not DATASET_PATH.exists()
+
+    if not download and set(CLASSES) != set(os.listdir(DATASET_PATH)):
+        download = True
+        shutil.rmtree(DATASET_PATH)
+
+    if download:
+        if not ZIP_PATH.is_file():
+            request.urlretrieve(DATASET_URL, ZIP_PATH)
+
+        ZipFile(ZIP_PATH).extractall(".")
+
+        if not DATASET_PATH.exists():
+            os.mkdir(DATASET_PATH)
+
+        for folder in os.walk("./realwaste-main/RealWaste/"):
+            class_name = folder[0].split("/")[-1:][0]
+            if class_name in CLASSES:
+                shutil.move(folder[0], DATASET_PATH)
+
+        shutil.rmtree("./realwaste-main/")
+
+    dataset = NamedImageFolder(
+        root=DATASET_PATH,
+        transform=transforms.Compose(
+            [transforms.Resize((500, 500)), transforms.ToTensor()]
+        ),
+    )
+
+    split = [1 - DATASET_TEST_PERCENT, DATASET_TEST_PERCENT]
+    dataset, test_dataset = data.random_split(dataset, split)
+
+    return dataset, test_dataset
+
+
+def train_transformer(dataset: Subset, device: DeviceObjType) -> VisionTransformer:
     model = VisionTransformer(
         image_size=500,
         patch_size=20,
         num_layers=8,
-        num_heads=12,
-        hidden_dim=768,
-        mlp_dim=3072,
+        num_heads=16,
+        hidden_dim=1024,
+        mlp_dim=2048,
         num_classes=2,
     ).to(device)
 
     optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = CrossEntropyLoss()
-    loader = DataLoader(dataset, batch_size=4)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE)
 
-    n = 0
-    for epoch in range(N_EPOCHS):
-        print("epoch {}".format(epoch))
+    n = 1
+    for epoch in range(EPOCHS):
+        print("Epoch {}".format(epoch))
 
         train_loss = 0.0
         for batch in loader:
-            n += 1
             print("-> batch {}".format(n))
+            print("   train_loss {}".format(train_loss), end="\033[F")
+            n += int(1)
 
             x, y, _ = batch
             x, y = x.to(device), y.to(device)
@@ -97,31 +109,43 @@ else:
             loss.backward()
             optimizer.step()
 
-        n = 0
+        print("\n\n", end="")
+    
+    torch.save(model, MODEL_PATH)
 
-    torch.save(model, './model')
-    model = torch.load('./model', weights_only=False)
+    return model
 
-loader = DataLoader(test_dataset, batch_size=4)
 
-total = 0
-correct = 0
-with torch.inference_mode():
-    for batch in loader:
-        x, y, p = batch
-        x, y, p = x.to(device), y.to(device), p
-        outputs = model(x)
+def main():
+    dataset, test_dataset = get_datasets()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = None
 
-        for n in range(len(outputs)):
-            if outputs[n].argmax().item() == y[n].item():
-                correct += 1
-            total += 1
+    try:
+        model = torch.load(MODEL_PATH, weights_only=False).to(device)
+    except FileNotFoundError:
+        model = train_transformer(dataset, device)
 
-        print(p)        
-        print(y)
-        print()
-        print(outputs)
-        print('-----------------')
+    with torch.inference_mode():
+        loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+        total = (len(loader) * BATCH_SIZE) - 1
+        correct = 0
 
-print("total correct: {}/{}".format(correct, total))
-print("percent: {}".format(correct / total))
+        for batch in loader:
+            x, y, n = batch
+            x, y = x.to(device), y.to(device)
+            y_hat = model(x)
+
+            for n in range(len(y_hat)):
+                if y_hat[n].argmax().item() == y[n].item():
+                    correct += 1
+
+        print("total correct {}/{}".format(correct, total))
+        print("percent: {}".format(correct / total))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('Canceled by KeyboardInterrupt')
