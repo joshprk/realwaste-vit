@@ -1,0 +1,6 @@
+.venv
+.pdm-python
+pdm.lock
+
+realwaste-main
+realwaste.zip
